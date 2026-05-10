@@ -13,7 +13,8 @@ POST /v1/responses/compact
 
 ## 功能
 
-- 压缩请求强制设置 `service_tier = "fast"`。
+- 压缩请求优先设置 `service_tier = "fast"`。
+- 如果上游返回 `Unsupported service_tier: fast`，同一个模型会自动去掉 `service_tier` 重试，并且本轮后续 fallback 也不再带 `service_tier`。
 - 压缩请求强制设置 `reasoning.effort = "low"`。
 - 压缩失败时按模型顺序自动重试。
 - 默认模型顺序：
@@ -27,6 +28,7 @@ gpt-5.2
 
 - `gpt-5.3-codex-spark` 默认只在估算输入不超过 `105000` tokens 时尝试，避免大上下文请求先撞 128k 上下文上限。
 - 不记录 Authorization、请求体或响应体。
+- 透明代理 Codex 的 WebSocket `/responses` 连接，避免本地 HTTP provider 导致 WebSocket 先失败再降级。
 - 支持 systemd 常驻和失败自动重启。
 - 支持 ChatGPT 登录的 Codex，默认上游是 `https://chatgpt.com/backend-api/codex`。
 
@@ -60,6 +62,8 @@ cd codex-compact-router
 ./scripts/status.sh
 curl http://127.0.0.1:18181/healthz
 ```
+
+如果你已经把当前 Codex 会话的 `openai_base_url` 指到了 `127.0.0.1:18181`，不要在这个会话里直接停掉正在承载它的旧代理服务。建议另开一个终端完成服务切换，或者先启动新会话再切换。
 
 ## 配置 Codex
 
@@ -129,7 +133,8 @@ sudo systemctl restart codex-compact-router.service
 | `CODEX_COMPACT_ROUTER_SMALL_CONTEXT_MODELS` | `gpt-5.3-codex-spark` | 小上下文模型集合 |
 | `CODEX_COMPACT_ROUTER_SMALL_MODEL_TOKEN_LIMIT` | `105000` | 小上下文模型的估算 token 上限 |
 | `CODEX_COMPACT_ROUTER_REASONING_EFFORT` | `low` | 压缩请求 reasoning effort |
-| `CODEX_COMPACT_ROUTER_SERVICE_TIER` | `fast` | 压缩请求 service tier |
+| `CODEX_COMPACT_ROUTER_SERVICE_TIER` | `fast` | 压缩请求优先使用的 service tier，设为 `none` 可完全不发送 |
+| `CODEX_COMPACT_ROUTER_AUTO_OMIT_UNSUPPORTED_SERVICE_TIER` | `true` | 上游拒绝 service tier 时自动去掉并重试 |
 | `CODEX_COMPACT_ROUTER_PROXY` | 空 | 显式上游 HTTP/HTTPS 代理 |
 | `CODEX_COMPACT_ROUTER_TIMEOUT_MS` | `1200000` | 单次上游请求超时 |
 | `CODEX_COMPACT_ROUTER_MAX_BODY_BYTES` | `268435456` | 最大请求体大小 |
@@ -145,8 +150,9 @@ systemd 默认写入：
 成功命中压缩路由时会看到类似：
 
 ```text
-compact model=gpt-5.3-codex estimated_tokens=90000 -> 502 1234ms
-compact model=gpt-5.3-codex-spark estimated_tokens=90000 -> 200 2345ms
+compact model=gpt-5.3-codex tier=fast estimated_tokens=90000 -> 400 1234ms
+compact upstream rejected service_tier=fast; retrying without service_tier
+compact model=gpt-5.3-codex tier=omitted estimated_tokens=90000 -> 200 2345ms
 ```
 
 如果 Codex 报错里仍然显示：
@@ -164,6 +170,20 @@ http://127.0.0.1:18181/responses/compact
 ```
 
 说明请求已经进入路由器，可以查看 `/var/log/codex-compact-router.log` 判断 fallback 是否发生。
+
+如果看到：
+
+```text
+Falling back from WebSockets to HTTPS transport
+```
+
+通常说明当前运行的路由器版本没有代理 WebSocket upgrade，或者服务还没有重启到新版本。更新后执行：
+
+```bash
+sudo systemctl restart codex-compact-router.service
+```
+
+新版本会把 `ws://127.0.0.1:18181/responses` 透明转发到上游的 WebSocket 端点。
 
 ## 卸载
 

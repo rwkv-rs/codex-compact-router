@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import http from "node:http";
+import https from "node:https";
 import { Readable } from "node:stream";
 
 const env = process.env;
@@ -36,6 +37,11 @@ const COMPACT_SERVICE_TIER = value(
   "CODEX_COMPACT_ROUTER_SERVICE_TIER",
   "CODEX_COMPACT_PROXY_SERVICE_TIER",
   "fast",
+);
+const AUTO_OMIT_UNSUPPORTED_SERVICE_TIER = booleanValue(
+  "CODEX_COMPACT_ROUTER_AUTO_OMIT_UNSUPPORTED_SERVICE_TIER",
+  "CODEX_COMPACT_PROXY_AUTO_OMIT_UNSUPPORTED_SERVICE_TIER",
+  true,
 );
 const MODEL_ORDER = listValue(
   "CODEX_COMPACT_ROUTER_MODELS",
@@ -74,6 +80,14 @@ function integerValue(primary, legacy, fallback) {
   }
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function booleanValue(primary, legacy, fallback) {
+  const raw = firstEnv(primary, legacy);
+  if (!raw) {
+    return fallback;
+  }
+  return !["0", "false", "no", "off"].includes(raw.toLowerCase());
 }
 
 function listValue(primary, legacy, fallback) {
@@ -125,6 +139,16 @@ function upstreamUrlFor(requestUrl, hostHeader) {
   return new URL(`${base}${endpoint}${incoming.search}`);
 }
 
+function upstreamWebSocketUrlFor(requestUrl, hostHeader) {
+  const target = upstreamUrlFor(requestUrl, hostHeader);
+  if (target.protocol === "https:") {
+    target.protocol = "wss:";
+  } else if (target.protocol === "http:") {
+    target.protocol = "ws:";
+  }
+  return target;
+}
+
 function cloneForwardHeaders(headers) {
   const excluded = new Set([
     "host",
@@ -140,6 +164,32 @@ function cloneForwardHeaders(headers) {
     }
   }
   return next;
+}
+
+function cloneUpgradeHeaders(headers, target) {
+  const excluded = new Set(["host"]);
+  const next = {};
+  for (const [name, headerValue] of Object.entries(headers)) {
+    if (!excluded.has(name.toLowerCase()) && headerValue !== undefined) {
+      next[name] = Array.isArray(headerValue) ? headerValue.join(", ") : headerValue;
+    }
+  }
+  next.host = target.host;
+  return next;
+}
+
+function writeRawHttpResponse(socket, statusCode, statusMessage, headers) {
+  socket.write(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n`);
+  for (const [name, headerValue] of Object.entries(headers)) {
+    if (Array.isArray(headerValue)) {
+      for (const value of headerValue) {
+        socket.write(`${name}: ${value}\r\n`);
+      }
+    } else if (headerValue !== undefined) {
+      socket.write(`${name}: ${headerValue}\r\n`);
+    }
+  }
+  socket.write("\r\n");
 }
 
 function cloneResponseHeaders(headers) {
@@ -190,18 +240,39 @@ function compactModelOrder(estimatedTokens) {
   return [...new Set(ordered)];
 }
 
-function compactBodyForModel(baseRequest, model) {
+function compactBodyForModel(baseRequest, model, includeServiceTier) {
+  const payload = {
+    ...baseRequest,
+    model,
+    reasoning: {
+      ...(baseRequest.reasoning ?? {}),
+      effort: COMPACT_REASONING_EFFORT,
+    },
+  };
+  if (includeServiceTier && COMPACT_SERVICE_TIER && COMPACT_SERVICE_TIER !== "none") {
+    payload.service_tier = COMPACT_SERVICE_TIER;
+  } else {
+    delete payload.service_tier;
+  }
   return Buffer.from(
-    JSON.stringify({
-      ...baseRequest,
-      model,
-      service_tier: COMPACT_SERVICE_TIER,
-      reasoning: {
-        ...(baseRequest.reasoning ?? {}),
-        effort: COMPACT_REASONING_EFFORT,
-      },
-    }),
+    JSON.stringify(payload),
   );
+}
+
+function isUnsupportedServiceTier(status, responseBody) {
+  if (status < 400 || responseBody.length === 0) {
+    return false;
+  }
+  const text = responseBody.toString("utf8");
+  try {
+    const parsed = JSON.parse(text);
+    const fields = [parsed.detail, parsed.error, parsed.message, parsed?.error?.message]
+      .filter(Boolean)
+      .map(String);
+    return fields.some((field) => field.includes("Unsupported service_tier"));
+  } catch {
+    return text.includes("Unsupported service_tier");
+  }
 }
 
 async function fetchUpstream(url, method, headers, body) {
@@ -258,35 +329,55 @@ async function forwardCompact(req, res, bodyBuffer) {
   let lastStatus = 502;
   let lastHeaders = { "content-type": "application/json" };
   let lastBody = Buffer.from(JSON.stringify({ error: "compact router exhausted all model fallbacks" }));
+  let includeServiceTier = Boolean(COMPACT_SERVICE_TIER && COMPACT_SERVICE_TIER !== "none");
+  let stopFallback = false;
 
   for (const model of models) {
-    const started = Date.now();
-    const attemptBody = compactBodyForModel(baseRequest, model);
-    try {
-      const response = await fetchUpstream(url, req.method, headers, attemptBody);
-      const responseBody = Buffer.from(await response.arrayBuffer());
-      log(
-        `compact model=${model} estimated_tokens=${estimatedTokens} -> ${response.status} ${Date.now() - started}ms`,
-      );
-      if (response.ok) {
-        res.writeHead(response.status, {
-          ...cloneResponseHeaders(response.headers),
-          "x-codex-compact-router-model": model,
-        });
-        res.end(responseBody);
-        return;
+    for (;;) {
+      const started = Date.now();
+      const attemptBody = compactBodyForModel(baseRequest, model, includeServiceTier);
+      const tierLabel = includeServiceTier ? COMPACT_SERVICE_TIER : "omitted";
+      try {
+        const response = await fetchUpstream(url, req.method, headers, attemptBody);
+        const responseBody = Buffer.from(await response.arrayBuffer());
+        log(
+          `compact model=${model} tier=${tierLabel} estimated_tokens=${estimatedTokens} -> ${response.status} ${Date.now() - started}ms`,
+        );
+        if (response.ok) {
+          res.writeHead(response.status, {
+            ...cloneResponseHeaders(response.headers),
+            "x-codex-compact-router-model": model,
+            "x-codex-compact-router-service-tier": tierLabel,
+          });
+          res.end(responseBody);
+          return;
+        }
+        if (
+          includeServiceTier &&
+          AUTO_OMIT_UNSUPPORTED_SERVICE_TIER &&
+          isUnsupportedServiceTier(response.status, responseBody)
+        ) {
+          includeServiceTier = false;
+          log(`compact upstream rejected service_tier=${COMPACT_SERVICE_TIER}; retrying without service_tier`);
+          continue;
+        }
+        lastStatus = response.status;
+        lastHeaders = cloneResponseHeaders(response.headers);
+        lastBody = responseBody;
+        if (response.status === 401 || response.status === 403) {
+          stopFallback = true;
+          break;
+        }
+      } catch (error) {
+        log(`compact model=${model} tier=${tierLabel} estimated_tokens=${estimatedTokens} -> transport_error ${Date.now() - started}ms`);
+        lastStatus = 502;
+        lastHeaders = { "content-type": "application/json" };
+        lastBody = Buffer.from(JSON.stringify({ error: String(error?.message ?? error) }));
       }
-      lastStatus = response.status;
-      lastHeaders = cloneResponseHeaders(response.headers);
-      lastBody = responseBody;
-      if (response.status === 401 || response.status === 403) {
-        break;
-      }
-    } catch (error) {
-      log(`compact model=${model} estimated_tokens=${estimatedTokens} -> transport_error ${Date.now() - started}ms`);
-      lastStatus = 502;
-      lastHeaders = { "content-type": "application/json" };
-      lastBody = Buffer.from(JSON.stringify({ error: String(error?.message ?? error) }));
+      break;
+    }
+    if (stopFallback) {
+      break;
     }
   }
 
@@ -295,6 +386,47 @@ async function forwardCompact(req, res, bodyBuffer) {
     "x-codex-compact-router-models-tried": models.join(","),
   });
   res.end(lastBody);
+}
+
+function proxyWebSocketUpgrade(req, socket, head) {
+  const started = Date.now();
+  const target = upstreamWebSocketUrlFor(req.url, req.headers.host);
+  const requestProtocol = target.protocol === "wss:" ? https : http;
+  const requestOptions = {
+    protocol: target.protocol === "wss:" ? "https:" : "http:",
+    hostname: target.hostname,
+    port: target.port || (target.protocol === "wss:" ? 443 : 80),
+    path: `${target.pathname}${target.search}`,
+    method: "GET",
+    headers: cloneUpgradeHeaders(req.headers, target),
+  };
+
+  const upstreamReq = requestProtocol.request(requestOptions);
+  upstreamReq.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+    writeRawHttpResponse(socket, upstreamRes.statusCode ?? 101, upstreamRes.statusMessage ?? "Switching Protocols", upstreamRes.headers);
+    if (upstreamHead?.length) {
+      socket.write(upstreamHead);
+    }
+    if (head?.length) {
+      upstreamSocket.write(head);
+    }
+    upstreamSocket.pipe(socket).pipe(upstreamSocket);
+    log(`WS ${new URL(req.url, "http://local").pathname} -> ${upstreamRes.statusCode ?? 101} ${Date.now() - started}ms`);
+  });
+  upstreamReq.on("response", (upstreamRes) => {
+    writeRawHttpResponse(socket, upstreamRes.statusCode ?? 502, upstreamRes.statusMessage ?? "Bad Gateway", upstreamRes.headers);
+    upstreamRes.pipe(socket);
+    upstreamRes.on("end", () => socket.destroy());
+    log(`WS ${new URL(req.url, "http://local").pathname} -> ${upstreamRes.statusCode ?? 502} ${Date.now() - started}ms`);
+  });
+  upstreamReq.on("error", (error) => {
+    if (!socket.destroyed) {
+      socket.write("HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\n\r\n");
+      socket.end(JSON.stringify({ error: String(error?.message ?? error) }));
+    }
+    log(`WS ${new URL(req.url, "http://local").pathname} -> transport_error ${Date.now() - started}ms`);
+  });
+  upstreamReq.end();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -308,6 +440,7 @@ const server = http.createServer(async (req, res) => {
         small_context_models: [...SMALL_CONTEXT_MODELS],
         small_model_token_limit: SMALL_MODEL_TOKEN_LIMIT,
         service_tier: COMPACT_SERVICE_TIER,
+        auto_omit_unsupported_service_tier: AUTO_OMIT_UNSUPPORTED_SERVICE_TIER,
         reasoning_effort: COMPACT_REASONING_EFFORT,
       }),
     );
@@ -334,3 +467,5 @@ server.listen(PORT, HOST, () => {
     `codex compact router listening on http://${HOST}:${PORT}; upstream=${UPSTREAM_BASE}; models=${MODEL_ORDER.join(">")}; small_limit=${SMALL_MODEL_TOKEN_LIMIT}; effort=${COMPACT_REASONING_EFFORT}; tier=${COMPACT_SERVICE_TIER}`,
   );
 });
+
+server.on("upgrade", proxyWebSocketUpgrade);
