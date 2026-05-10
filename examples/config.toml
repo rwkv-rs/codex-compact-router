@@ -1,0 +1,9 @@
+# Add this to ~/.codex/config.toml after starting the router.
+# Restart Codex after editing because provider base_url is session-scoped.
+openai_base_url = "http://127.0.0.1:18181"
+
+# Optional: compact earlier. For a 272000-token model window, 80% is 217600.
+model_auto_compact_token_limit = 217600
+
+# Optional: normal requests can also ask for fast service tier.
+service_tier = "fast"

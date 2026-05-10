@@ -1,0 +1,20 @@
+{
+  "name": "codex-compact-router",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "A local router for Codex compact requests with fast service tier and model fallback.",
+  "bin": {
+    "codex-compact-router": "./bin/codex-compact-router.mjs"
+  },
+  "scripts": {
+    "check": "node --check bin/codex-compact-router.mjs"
+  },
+  "dependencies": {
+    "undici": "^7.16.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

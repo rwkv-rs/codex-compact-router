@@ -1,0 +1,19 @@
+[Unit]
+Description=Codex compact request router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT_DIR__
+Environment=CODEX_COMPACT_ROUTER_HOST=127.0.0.1
+Environment=CODEX_COMPACT_ROUTER_PORT=18181
+Environment=CODEX_COMPACT_ROUTER_UPSTREAM=https://chatgpt.com/backend-api/codex
+ExecStart=__NODE_BIN__ __PROJECT_DIR__/bin/codex-compact-router.mjs
+Restart=always
+RestartSec=2
+StandardOutput=append:/var/log/codex-compact-router.log
+StandardError=append:/var/log/codex-compact-router.log
+
+[Install]
+WantedBy=multi-user.target
