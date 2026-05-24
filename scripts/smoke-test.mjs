@@ -71,6 +71,7 @@ try {
 
   const upgradeResponse = await rawUpgrade(routerPort);
   assert.match(upgradeResponse, /^HTTP\/1\.1 101 Switching Protocols/i);
+  await assertRouterStayedAlive(router);
 
   console.log("smoke tests passed");
 } finally {
@@ -111,6 +112,7 @@ function rawUpgrade(port) {
     socket.on("data", (chunk) => {
       data += chunk.toString("utf8");
       if (data.includes("\r\n\r\n")) {
+        socket.write("client data after upstream close");
         socket.destroy();
         resolve(data);
       }
@@ -121,4 +123,9 @@ function rawUpgrade(port) {
     });
     socket.on("error", reject);
   });
+}
+
+async function assertRouterStayedAlive(child) {
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(child.exitCode, null);
 }

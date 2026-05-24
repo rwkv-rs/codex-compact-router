@@ -192,6 +192,32 @@ function writeRawHttpResponse(socket, statusCode, statusMessage, headers) {
   socket.write("\r\n");
 }
 
+function bridgeDuplexSockets(left, right) {
+  let closed = false;
+  const closeBoth = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    left.unpipe(right);
+    right.unpipe(left);
+    if (!left.destroyed) {
+      left.destroy();
+    }
+    if (!right.destroyed) {
+      right.destroy();
+    }
+  };
+  left.on("error", closeBoth);
+  right.on("error", closeBoth);
+  left.on("end", closeBoth);
+  right.on("end", closeBoth);
+  left.on("close", closeBoth);
+  right.on("close", closeBoth);
+  left.pipe(right);
+  right.pipe(left);
+}
+
 function cloneResponseHeaders(headers) {
   const excluded = new Set([
     "connection",
@@ -402,7 +428,9 @@ function proxyWebSocketUpgrade(req, socket, head) {
   };
 
   const upstreamReq = requestProtocol.request(requestOptions);
+  socket.on("error", () => {});
   upstreamReq.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+    upstreamSocket.on("error", () => {});
     writeRawHttpResponse(socket, upstreamRes.statusCode ?? 101, upstreamRes.statusMessage ?? "Switching Protocols", upstreamRes.headers);
     if (upstreamHead?.length) {
       socket.write(upstreamHead);
@@ -410,7 +438,7 @@ function proxyWebSocketUpgrade(req, socket, head) {
     if (head?.length) {
       upstreamSocket.write(head);
     }
-    upstreamSocket.pipe(socket).pipe(upstreamSocket);
+    bridgeDuplexSockets(upstreamSocket, socket);
     log(`WS ${new URL(req.url, "http://local").pathname} -> ${upstreamRes.statusCode ?? 101} ${Date.now() - started}ms`);
   });
   upstreamReq.on("response", (upstreamRes) => {
