@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import http from "node:http";
-import https from "node:https";
 import net from "node:net";
+import tls from "node:tls";
 import { Readable } from "node:stream";
 
 const env = process.env;
@@ -99,9 +99,12 @@ function listValue(primary, legacy, fallback) {
 }
 
 async function resolveProxyUrl() {
-  const raw = firstEnv(
-    "CODEX_COMPACT_ROUTER_PROXY",
-    "CODEX_COMPACT_PROXY_PROXY",
+  const explicit = firstPresentEnv("CODEX_COMPACT_ROUTER_PROXY", "CODEX_COMPACT_PROXY_PROXY");
+  if (explicit) {
+    return await normalizeProxySetting(explicit.value, explicit.name, true);
+  }
+
+  const inherited = firstPresentEnv(
     "HTTPS_PROXY",
     "https_proxy",
     "HTTP_PROXY",
@@ -109,8 +112,33 @@ async function resolveProxyUrl() {
     "ALL_PROXY",
     "all_proxy",
   );
-  if (!raw || raw.toLowerCase() !== "auto") {
-    return raw;
+  if (!inherited) {
+    return undefined;
+  }
+
+  return await normalizeProxySetting(inherited.value, inherited.name, false);
+}
+
+function firstPresentEnv(...names) {
+  for (const name of names) {
+    if (Object.hasOwn(env, name)) {
+      return { name, value: env[name] ?? "" };
+    }
+  }
+  return undefined;
+}
+
+async function normalizeProxySetting(rawValue, sourceName, explicit) {
+  const raw = rawValue.trim();
+  const lowered = raw.toLowerCase();
+  if (!raw || ["0", "false", "no", "off", "none", "direct"].includes(lowered)) {
+    if (explicit) {
+      log(`${sourceName} disables upstream proxy`);
+    }
+    return undefined;
+  }
+  if (lowered !== "auto") {
+    return normalizeProxyUrl(raw, sourceName, explicit);
   }
 
   const candidates = listValue(
@@ -127,6 +155,31 @@ async function resolveProxyUrl() {
   return undefined;
 }
 
+function normalizeProxyUrl(raw, sourceName, explicit) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return handleProxyConfigError(`${sourceName} has invalid upstream proxy URL ${raw}`, explicit);
+  }
+  if (!isHttpProxyProtocol(url.protocol)) {
+    return handleProxyConfigError(`${sourceName} uses unsupported upstream proxy protocol ${url.protocol}`, explicit);
+  }
+  return url.toString();
+}
+
+function handleProxyConfigError(message, explicit) {
+  if (explicit) {
+    throw new Error(message);
+  }
+  log(`${message}; ignoring inherited proxy`);
+  return undefined;
+}
+
+function isHttpProxyProtocol(protocol) {
+  return protocol === "http:" || protocol === "https:";
+}
+
 function canConnectToProxy(raw) {
   return new Promise((resolve) => {
     let url;
@@ -134,6 +187,11 @@ function canConnectToProxy(raw) {
       url = new URL(raw);
     } catch {
       log(`skipping invalid auto proxy candidate ${raw}`);
+      resolve(false);
+      return;
+    }
+    if (!isHttpProxyProtocol(url.protocol)) {
+      log(`skipping unsupported auto proxy candidate ${raw}`);
       resolve(false);
       return;
     }
@@ -235,8 +293,8 @@ function cloneUpgradeHeaders(headers, target) {
   return next;
 }
 
-function writeRawHttpResponse(socket, statusCode, statusMessage, headers) {
-  socket.write(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n`);
+function writeRawHttpRequest(socket, method, path, headers) {
+  socket.write(`${method} ${path} HTTP/1.1\r\n`);
   for (const [name, headerValue] of Object.entries(headers)) {
     if (Array.isArray(headerValue)) {
       for (const value of headerValue) {
@@ -273,6 +331,153 @@ function bridgeDuplexSockets(left, right) {
   right.on("close", closeBoth);
   left.pipe(right);
   right.pipe(left);
+}
+
+function connectNetSocket(options) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(options);
+    const cleanup = () => {
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+    };
+    const onConnect = () => {
+      cleanup();
+      resolve(socket);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+  });
+}
+
+function connectTlsSocket(options) {
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect(options);
+    const cleanup = () => {
+      socket.off("secureConnect", onSecureConnect);
+      socket.off("error", onError);
+    };
+    const onSecureConnect = () => {
+      cleanup();
+      resolve(socket);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    socket.once("secureConnect", onSecureConnect);
+    socket.once("error", onError);
+  });
+}
+
+function readHttpHead(socket) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    const cleanup = () => {
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("end", onEnd);
+    };
+    const onData = (chunk) => {
+      chunks.push(chunk);
+      total += chunk.length;
+      const buffer = Buffer.concat(chunks, total);
+      const marker = buffer.indexOf("\r\n\r\n");
+      if (marker === -1) {
+        return;
+      }
+      cleanup();
+      resolve({
+        head: buffer.subarray(0, marker + 4),
+        remainder: buffer.subarray(marker + 4),
+      });
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onEnd = () => {
+      cleanup();
+      reject(new Error("socket ended before HTTP headers completed"));
+    };
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("end", onEnd);
+  });
+}
+
+function parseStatusCode(responseHead) {
+  const endOfLine = responseHead.indexOf("\r\n");
+  const firstLine = responseHead.toString("latin1", 0, endOfLine === -1 ? undefined : endOfLine);
+  const match = /^HTTP\/\d(?:\.\d)?\s+(\d{3})\b/i.exec(firstLine);
+  return match ? Number.parseInt(match[1], 10) : undefined;
+}
+
+function proxyAuthorizationHeader(proxy) {
+  if (!proxy.username && !proxy.password) {
+    return undefined;
+  }
+  return `Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64")}`;
+}
+
+async function openHttpConnectTunnel(target) {
+  const proxy = new URL(PROXY_URL);
+  const proxyPort = Number.parseInt(proxy.port || (proxy.protocol === "https:" ? "443" : "80"), 10);
+  const socket = proxy.protocol === "https:"
+    ? await connectTlsSocket({
+        host: proxy.hostname,
+        port: proxyPort,
+        servername: proxy.hostname,
+        ALPNProtocols: ["http/1.1"],
+      })
+    : await connectNetSocket({ host: proxy.hostname, port: proxyPort });
+
+  const targetPort = target.port || (target.protocol === "wss:" ? "443" : "80");
+  const authority = `${target.hostname}:${targetPort}`;
+  const headers = {
+    host: authority,
+    "proxy-connection": "keep-alive",
+  };
+  const authorization = proxyAuthorizationHeader(proxy);
+  if (authorization) {
+    headers["proxy-authorization"] = authorization;
+  }
+  writeRawHttpRequest(socket, "CONNECT", authority, headers);
+
+  const { head, remainder } = await readHttpHead(socket);
+  const statusCode = parseStatusCode(head);
+  if (statusCode === undefined || statusCode < 200 || statusCode >= 300) {
+    socket.destroy();
+    throw new Error(`proxy CONNECT ${authority} failed with status ${statusCode ?? "unknown"}`);
+  }
+  if (remainder.length) {
+    socket.unshift(remainder);
+  }
+  return socket;
+}
+
+async function openWebSocketUpstreamSocket(target) {
+  let socket;
+  if (PROXY_URL) {
+    socket = await openHttpConnectTunnel(target);
+  } else {
+    const port = Number.parseInt(target.port || (target.protocol === "wss:" ? "443" : "80"), 10);
+    socket = await connectNetSocket({ host: target.hostname, port });
+  }
+
+  if (target.protocol !== "wss:") {
+    return socket;
+  }
+
+  return await connectTlsSocket({
+    socket,
+    servername: target.hostname,
+    ALPNProtocols: ["http/1.1"],
+  });
 }
 
 function cloneResponseHeaders(headers) {
@@ -471,47 +676,47 @@ async function forwardCompact(req, res, bodyBuffer) {
   res.end(lastBody);
 }
 
-function proxyWebSocketUpgrade(req, socket, head) {
+async function proxyWebSocketUpgrade(req, socket, head) {
   const started = Date.now();
   const target = upstreamWebSocketUrlFor(req.url, req.headers.host);
-  const requestProtocol = target.protocol === "wss:" ? https : http;
-  const requestOptions = {
-    protocol: target.protocol === "wss:" ? "https:" : "http:",
-    hostname: target.hostname,
-    port: target.port || (target.protocol === "wss:" ? 443 : 80),
-    path: `${target.pathname}${target.search}`,
-    method: "GET",
-    headers: cloneUpgradeHeaders(req.headers, target),
-  };
-
-  const upstreamReq = requestProtocol.request(requestOptions);
   socket.on("error", () => {});
-  upstreamReq.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+
+  try {
+    const upstreamSocket = await openWebSocketUpstreamSocket(target);
     upstreamSocket.on("error", () => {});
-    writeRawHttpResponse(socket, upstreamRes.statusCode ?? 101, upstreamRes.statusMessage ?? "Switching Protocols", upstreamRes.headers);
-    if (upstreamHead?.length) {
-      socket.write(upstreamHead);
+
+    writeRawHttpRequest(
+      upstreamSocket,
+      "GET",
+      `${target.pathname}${target.search}`,
+      cloneUpgradeHeaders(req.headers, target),
+    );
+
+    const { head: upstreamHead, remainder } = await readHttpHead(upstreamSocket);
+    const statusCode = parseStatusCode(upstreamHead);
+    socket.write(upstreamHead);
+    if (remainder.length) {
+      socket.write(remainder);
     }
+    log(`WS ${new URL(req.url, "http://local").pathname} -> ${statusCode ?? "unknown"} ${Date.now() - started}ms`);
+
+    if (statusCode !== 101) {
+      upstreamSocket.pipe(socket);
+      upstreamSocket.on("end", () => socket.destroy());
+      return;
+    }
+
     if (head?.length) {
       upstreamSocket.write(head);
     }
     bridgeDuplexSockets(upstreamSocket, socket);
-    log(`WS ${new URL(req.url, "http://local").pathname} -> ${upstreamRes.statusCode ?? 101} ${Date.now() - started}ms`);
-  });
-  upstreamReq.on("response", (upstreamRes) => {
-    writeRawHttpResponse(socket, upstreamRes.statusCode ?? 502, upstreamRes.statusMessage ?? "Bad Gateway", upstreamRes.headers);
-    upstreamRes.pipe(socket);
-    upstreamRes.on("end", () => socket.destroy());
-    log(`WS ${new URL(req.url, "http://local").pathname} -> ${upstreamRes.statusCode ?? 502} ${Date.now() - started}ms`);
-  });
-  upstreamReq.on("error", (error) => {
+  } catch (error) {
     if (!socket.destroyed) {
       socket.write("HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\n\r\n");
       socket.end(JSON.stringify({ error: String(error?.message ?? error) }));
     }
-    log(`WS ${new URL(req.url, "http://local").pathname} -> transport_error ${Date.now() - started}ms`);
-  });
-  upstreamReq.end();
+    log(`WS ${new URL(req.url, "http://local").pathname} -> transport_error ${Date.now() - started}ms ${error?.message ?? error}`);
+  }
 }
 
 const server = http.createServer(async (req, res) => {

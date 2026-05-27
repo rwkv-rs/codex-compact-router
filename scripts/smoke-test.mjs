@@ -7,6 +7,10 @@ import { spawn } from "node:child_process";
 
 const upstreamPort = 19182;
 const routerPort = 19183;
+const httpProxyPort = 19184;
+const proxiedRouterPort = 19185;
+const wsProxyPort = 19186;
+const proxiedWsRouterPort = 19187;
 const compactBodies = [];
 
 const upstream = http.createServer(async (req, res) => {
@@ -45,6 +49,9 @@ const router = spawn(process.execPath, ["bin/codex-compact-router.mjs"], {
     CODEX_COMPACT_ROUTER_PORT: String(routerPort),
     CODEX_COMPACT_ROUTER_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
     CODEX_COMPACT_ROUTER_PROXY: "",
+    HTTPS_PROXY: "http://127.0.0.1:1",
+    HTTP_PROXY: "http://127.0.0.1:1",
+    ALL_PROXY: "http://127.0.0.1:1",
   },
   stdio: ["ignore", "ignore", "pipe"],
 });
@@ -72,6 +79,9 @@ try {
   const upgradeResponse = await rawUpgrade(routerPort);
   assert.match(upgradeResponse, /^HTTP\/1\.1 101 Switching Protocols/i);
   await assertRouterStayedAlive(router);
+
+  await testProxiedHttpForward();
+  await testProxiedWebSocketUpgrade();
 
   console.log("smoke tests passed");
 } finally {
@@ -128,4 +138,95 @@ function rawUpgrade(port) {
 async function assertRouterStayedAlive(child) {
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(child.exitCode, null);
+}
+
+async function testProxiedHttpForward() {
+  await withTunnelProxy(httpProxyPort, /^POST \/backend-api\/codex\/responses HTTP\/1\.1\r\n/i, (socket) => {
+    socket.write(
+      "HTTP/1.1 200 OK\r\n" +
+        "content-type: application/json\r\n" +
+        "content-length: 11\r\n" +
+        "\r\n" +
+        "{\"ok\":true}",
+    );
+    socket.end();
+  }, async () => {
+    const proxiedRouter = startRouter(proxiedRouterPort, httpProxyPort);
+    try {
+      await waitForHealth(proxiedRouterPort);
+      const response = await fetch(`http://127.0.0.1:${proxiedRouterPort}/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ input: "normal" }),
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { ok: true });
+      await assertRouterStayedAlive(proxiedRouter);
+    } finally {
+      proxiedRouter.kill("SIGTERM");
+    }
+  });
+}
+
+async function testProxiedWebSocketUpgrade() {
+  await withTunnelProxy(wsProxyPort, /^GET \/backend-api\/codex\/responses HTTP\/1\.1\r\n/i, (socket) => {
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "upgrade: websocket\r\n" +
+        "connection: Upgrade\r\n" +
+        "\r\n",
+    );
+    socket.end();
+  }, async () => {
+    const proxiedRouter = startRouter(proxiedWsRouterPort, wsProxyPort);
+    try {
+      await waitForHealth(proxiedWsRouterPort);
+      const upgradeResponse = await rawUpgrade(proxiedWsRouterPort);
+      assert.match(upgradeResponse, /^HTTP\/1\.1 101 Switching Protocols/i);
+      await assertRouterStayedAlive(proxiedRouter);
+    } finally {
+      proxiedRouter.kill("SIGTERM");
+    }
+  });
+}
+
+async function withTunnelProxy(port, expectedRequestLine, sendResponse, runClient) {
+  let connectCount = 0;
+  const proxy = http.createServer();
+  proxy.on("connect", (req, socket) => {
+    connectCount += 1;
+    assert.equal(req.url, "codex-upstream.test:80");
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    let request = "";
+    socket.on("data", (chunk) => {
+      request += chunk.toString("utf8");
+      if (!request.includes("\r\n\r\n")) {
+        return;
+      }
+      assert.match(request, expectedRequestLine);
+      sendResponse(socket);
+    });
+  });
+  await new Promise((resolve) => proxy.listen(port, "127.0.0.1", resolve));
+
+  try {
+    await runClient();
+    assert.equal(connectCount, 1);
+  } finally {
+    proxy.close();
+  }
+}
+
+function startRouter(routerPort, proxyPort) {
+  return spawn(process.execPath, ["bin/codex-compact-router.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: {
+      ...process.env,
+      CODEX_COMPACT_ROUTER_PORT: String(routerPort),
+      CODEX_COMPACT_ROUTER_UPSTREAM: "http://codex-upstream.test/backend-api/codex",
+      CODEX_COMPACT_ROUTER_PROXY: `http://127.0.0.1:${proxyPort}`,
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
 }

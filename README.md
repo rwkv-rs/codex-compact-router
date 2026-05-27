@@ -28,7 +28,7 @@ gpt-5.2
 
 - `gpt-5.3-codex-spark` 默认只在估算输入不超过 `105000` tokens 时尝试，避免大上下文请求先撞 128k 上下文上限。
 - 不记录 Authorization、请求体或响应体。
-- 透明代理 Codex 的 WebSocket `/responses` 连接，避免本地 HTTP provider 导致 WebSocket 先失败再降级。
+- 透明代理 Codex 的普通 HTTP 请求和 WebSocket `/responses` 连接，避免本地 HTTP provider 导致 WebSocket 先失败再降级。
 - 支持 systemd 常驻和失败自动重启。
 - 支持 ChatGPT 登录的 Codex，默认上游是 `https://chatgpt.com/backend-api/codex`。
 
@@ -41,7 +41,7 @@ gpt-5.2
 - 如果使用 `OPENAI_API_KEY` 模式，需要把上游改成 `https://api.openai.com/v1`。
 - 如果使用 Clash Verge，推荐开启 TUN/增强模式，让 Node 进程的直连流量也被接管。
 - systemd 模板默认设置 `CODEX_COMPACT_ROUTER_PROXY=auto`，会在启动时探测 `http://127.0.0.1:7890`；端口不可达时回落为直连。
-- 如果只使用 HTTP 代理环境变量，可以显式设置 `CODEX_COMPACT_ROUTER_PROXY`，例如 `http://127.0.0.1:7890`。
+- 如果只使用 HTTP 代理环境变量，可以显式设置 `CODEX_COMPACT_ROUTER_PROXY`，例如 `http://127.0.0.1:7890`；普通 HTTP 请求和 WebSocket upgrade 都会走同一个代理配置。
 
 ## 安装
 
@@ -135,6 +135,15 @@ Environment=CODEX_COMPACT_ROUTER_PROXY=http://127.0.0.1:7890
 sudo systemctl daemon-reload
 sudo systemctl restart codex-compact-router.service
 ```
+
+代理解析优先级是：
+
+1. `CODEX_COMPACT_ROUTER_PROXY` / `CODEX_COMPACT_PROXY_PROXY`。
+2. `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 及其小写形式。
+
+如果显式设置了 `CODEX_COMPACT_ROUTER_PROXY`，即使值为空、`direct`、`off`
+或 `none`，也会停止继续继承系统代理并改为直连。当前只支持 HTTP/HTTPS
+代理；WebSocket 转发会通过 HTTP `CONNECT` 隧道访问上游。
 
 ## 环境变量
 
