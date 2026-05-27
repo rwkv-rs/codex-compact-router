@@ -2,6 +2,7 @@
 
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
 import { Readable } from "node:stream";
 
 const env = process.env;
@@ -55,7 +56,7 @@ const SMALL_CONTEXT_MODELS = new Set(
     "gpt-5.3-codex-spark",
   ),
 );
-const PROXY_URL = firstEnv("CODEX_COMPACT_ROUTER_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy");
+const PROXY_URL = await resolveProxyUrl();
 
 await configureProxyDispatcher();
 
@@ -95,6 +96,62 @@ function listValue(primary, legacy, fallback) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+async function resolveProxyUrl() {
+  const raw = firstEnv(
+    "CODEX_COMPACT_ROUTER_PROXY",
+    "CODEX_COMPACT_PROXY_PROXY",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  );
+  if (!raw || raw.toLowerCase() !== "auto") {
+    return raw;
+  }
+
+  const candidates = listValue(
+    "CODEX_COMPACT_ROUTER_AUTO_PROXY_CANDIDATES",
+    "CODEX_COMPACT_PROXY_AUTO_PROXY_CANDIDATES",
+    "http://127.0.0.1:7890",
+  );
+  for (const candidate of candidates) {
+    if (await canConnectToProxy(candidate)) {
+      return candidate;
+    }
+  }
+  log(`no auto proxy candidate is reachable; using direct upstream connection`);
+  return undefined;
+}
+
+function canConnectToProxy(raw) {
+  return new Promise((resolve) => {
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      log(`skipping invalid auto proxy candidate ${raw}`);
+      resolve(false);
+      return;
+    }
+
+    const port = Number.parseInt(url.port || (url.protocol === "https:" ? "443" : "80"), 10);
+    const socket = net.connect({ host: url.hostname, port });
+    const done = (result) => {
+      socket.removeAllListeners();
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+      resolve(result);
+    };
+    socket.setTimeout(300);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
 }
 
 async function configureProxyDispatcher() {
@@ -470,6 +527,7 @@ const server = http.createServer(async (req, res) => {
         service_tier: COMPACT_SERVICE_TIER,
         auto_omit_unsupported_service_tier: AUTO_OMIT_UNSUPPORTED_SERVICE_TIER,
         reasoning_effort: COMPACT_REASONING_EFFORT,
+        upstream_proxy_configured: Boolean(PROXY_URL),
       }),
     );
     return;

@@ -40,7 +40,8 @@ gpt-5.2
 - 如果使用 ChatGPT 登录的 Codex，保持默认上游即可。
 - 如果使用 `OPENAI_API_KEY` 模式，需要把上游改成 `https://api.openai.com/v1`。
 - 如果使用 Clash Verge，推荐开启 TUN/增强模式，让 Node 进程的直连流量也被接管。
-- 如果只使用 HTTP 代理环境变量，可以设置 `CODEX_COMPACT_ROUTER_PROXY`，例如 `http://127.0.0.1:7890`。
+- systemd 模板默认设置 `CODEX_COMPACT_ROUTER_PROXY=auto`，会在启动时探测 `http://127.0.0.1:7890`；端口不可达时回落为直连。
+- 如果只使用 HTTP 代理环境变量，可以显式设置 `CODEX_COMPACT_ROUTER_PROXY`，例如 `http://127.0.0.1:7890`。
 
 ## 安装
 
@@ -76,9 +77,13 @@ openai_base_url = "http://127.0.0.1:18181"
 推荐同时设置：
 
 ```toml
-service_tier = "fast"
+service_tier = "default"
 model_auto_compact_token_limit = 217600
 ```
+
+不要在 Codex 全局配置里设置 `service_tier = "fast"`，否则普通 `/responses`
+请求也会要求 fast。这个路由器会只在 `/responses/compact` 上注入
+`service_tier = "fast"`。
 
 `217600` 是 `272000` 上下文窗口的 80%。如果你的主模型上下文窗口不是 `272000`，按实际窗口乘以 `0.8` 计算。
 
@@ -109,7 +114,16 @@ sudo systemctl restart codex-compact-router.service
 
 推荐方式是打开 Clash Verge 的 TUN/增强模式。这样 `codex-compact-router` 访问 `chatgpt.com` 或 `api.openai.com` 时会被系统网络层接管。
 
-如果你只想显式走 Clash HTTP 代理，可以给 systemd 服务加：
+systemd 模板默认包含：
+
+```ini
+Environment=CODEX_COMPACT_ROUTER_PROXY=auto
+```
+
+这会在启动时探测 `http://127.0.0.1:7890`，适合 Spark 这类由
+`clashctl` 提供本机 HTTP 代理的机器。
+
+如果你想固定走某个 HTTP 代理，可以给 systemd 服务改成：
 
 ```ini
 Environment=CODEX_COMPACT_ROUTER_PROXY=http://127.0.0.1:7890
@@ -135,7 +149,8 @@ sudo systemctl restart codex-compact-router.service
 | `CODEX_COMPACT_ROUTER_REASONING_EFFORT` | `low` | 压缩请求 reasoning effort |
 | `CODEX_COMPACT_ROUTER_SERVICE_TIER` | `fast` | 压缩请求优先使用的 service tier，设为 `none` 可完全不发送 |
 | `CODEX_COMPACT_ROUTER_AUTO_OMIT_UNSUPPORTED_SERVICE_TIER` | `true` | 上游拒绝 service tier 时自动去掉并重试 |
-| `CODEX_COMPACT_ROUTER_PROXY` | 空 | 显式上游 HTTP/HTTPS 代理 |
+| `CODEX_COMPACT_ROUTER_PROXY` | 空 | 上游 HTTP/HTTPS 代理；设为 `auto` 时探测候选本机代理 |
+| `CODEX_COMPACT_ROUTER_AUTO_PROXY_CANDIDATES` | `http://127.0.0.1:7890` | `CODEX_COMPACT_ROUTER_PROXY=auto` 时按顺序探测的代理列表，逗号分隔 |
 | `CODEX_COMPACT_ROUTER_TIMEOUT_MS` | `1200000` | 单次上游请求超时 |
 | `CODEX_COMPACT_ROUTER_MAX_BODY_BYTES` | `268435456` | 最大请求体大小 |
 

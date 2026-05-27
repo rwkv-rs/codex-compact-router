@@ -10,6 +10,7 @@ Environment=CODEX_COMPACT_ROUTER_HOST=127.0.0.1
 Environment=CODEX_COMPACT_ROUTER_PORT=18181
 Environment=CODEX_COMPACT_ROUTER_UPSTREAM=https://chatgpt.com/backend-api/codex
 Environment=CODEX_COMPACT_ROUTER_AUTO_OMIT_UNSUPPORTED_SERVICE_TIER=true
+Environment=CODEX_COMPACT_ROUTER_PROXY=auto
 ExecStart=__NODE_BIN__ __PROJECT_DIR__/bin/codex-compact-router.mjs
 Restart=always
 RestartSec=2
