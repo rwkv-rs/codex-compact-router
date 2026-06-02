@@ -70,7 +70,7 @@ try {
   });
   assert.equal(compactResponse.status, 200);
   const compactJson = await compactResponse.json();
-  assert.equal(compactJson.model, "gpt-5.3-codex");
+  assert.equal(compactJson.model, "gpt-5.4-mini");
   assert.equal(compactJson.effort, "low");
   assert.equal(compactBodies.length, 2);
   assert.equal(compactBodies[0].service_tier, "fast");

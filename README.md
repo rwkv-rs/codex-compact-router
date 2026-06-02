@@ -20,13 +20,9 @@ POST /v1/responses/compact
 - 默认模型顺序：
 
 ```text
-gpt-5.3-codex
-gpt-5.3-codex-spark
 gpt-5.4-mini
-gpt-5.2
 ```
 
-- `gpt-5.3-codex-spark` 默认只在估算输入不超过 `105000` tokens 时尝试，避免大上下文请求先撞 128k 上下文上限。
 - 不记录 Authorization、请求体或响应体。
 - 透明代理 Codex 的普通 HTTP 请求和 WebSocket `/responses` 连接，避免本地 HTTP provider 导致 WebSocket 先失败再降级。
 - 支持 systemd 常驻和失败自动重启。
@@ -152,8 +148,8 @@ sudo systemctl restart codex-compact-router.service
 | `CODEX_COMPACT_ROUTER_HOST` | `127.0.0.1` | 监听地址 |
 | `CODEX_COMPACT_ROUTER_PORT` | `18181` | 监听端口 |
 | `CODEX_COMPACT_ROUTER_UPSTREAM` | `https://chatgpt.com/backend-api/codex` | 上游 Codex/OpenAI base URL |
-| `CODEX_COMPACT_ROUTER_MODELS` | `gpt-5.3-codex,gpt-5.3-codex-spark,gpt-5.4-mini,gpt-5.2` | 压缩 fallback 模型顺序 |
-| `CODEX_COMPACT_ROUTER_SMALL_CONTEXT_MODELS` | `gpt-5.3-codex-spark` | 小上下文模型集合 |
+| `CODEX_COMPACT_ROUTER_MODELS` | `gpt-5.4-mini` | 压缩 fallback 模型顺序 |
+| `CODEX_COMPACT_ROUTER_SMALL_CONTEXT_MODELS` | 空 | 小上下文模型集合 |
 | `CODEX_COMPACT_ROUTER_SMALL_MODEL_TOKEN_LIMIT` | `105000` | 小上下文模型的估算 token 上限 |
 | `CODEX_COMPACT_ROUTER_REASONING_EFFORT` | `low` | 压缩请求 reasoning effort |
 | `CODEX_COMPACT_ROUTER_SERVICE_TIER` | `fast` | 压缩请求优先使用的 service tier，设为 `none` 可完全不发送 |
@@ -174,9 +170,9 @@ systemd 默认写入：
 成功命中压缩路由时会看到类似：
 
 ```text
-compact model=gpt-5.3-codex tier=fast estimated_tokens=90000 -> 400 1234ms
+compact model=gpt-5.4-mini tier=fast estimated_tokens=90000 -> 400 1234ms
 compact upstream rejected service_tier=fast; retrying without service_tier
-compact model=gpt-5.3-codex tier=omitted estimated_tokens=90000 -> 200 2345ms
+compact model=gpt-5.4-mini tier=omitted estimated_tokens=90000 -> 200 2345ms
 ```
 
 如果 Codex 报错里仍然显示：

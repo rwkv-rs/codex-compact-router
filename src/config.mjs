@@ -7,14 +7,14 @@ export async function loadConfig(env = process.env) {
     env,
     "CODEX_COMPACT_ROUTER_MODELS",
     "CODEX_COMPACT_PROXY_MODELS",
-    "gpt-5.3-codex,gpt-5.3-codex-spark,gpt-5.4-mini,gpt-5.2",
+    "gpt-5.4-mini",
   );
   const smallContextModels = new Set(
     listValue(
       env,
       "CODEX_COMPACT_ROUTER_SMALL_CONTEXT_MODELS",
       "CODEX_COMPACT_PROXY_SMALL_MODELS",
-      "gpt-5.3-codex-spark",
+      "",
     ),
   );
 
